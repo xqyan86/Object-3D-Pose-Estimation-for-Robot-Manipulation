@@ -1,0 +1,132 @@
+#!/usr/bin/env python
+
+# USE_GAZEBO = True
+
+# Import required Python code.
+import math
+import time
+from matplotlib import pyplot as plt
+import os
+import csv
+import cPickle
+
+#---- ROS ------
+import roslib; roslib.load_manifest('deep_pose_estimation')
+import rospkg
+import rospy
+import actionlib
+from cv_bridge import CvBridge, CvBridgeError
+from std_msgs.msg import *
+from sensor_msgs.msg import Image
+from sensor_msgs.msg import JointState
+from geometry_msgs.msg import WrenchStamped
+# ---- For Gazebo -----
+import std_srvs.srv as srv
+from geometry_msgs.msg import PoseArray
+
+
+MAX_DEPTH_RANGE = 7000.0 #mm
+#SAVE_CONTINUOUS_DATA = False
+DRAW_EACH_IMAGE_FEATURE = False
+#ROS_RUN_RATE = 15
+ROS_RUN_RATE = 30
+MAX_NUMBER_IMAGES = ROS_RUN_RATE*60 # 1 min
+
+SAVE_IMAGE = False
+
+import numpy as np
+import cv2
+
+
+
+class PerceptionParameterNode():
+    def __init__(self,name):
+        self.bridge = CvBridge()
+
+        self.img_counter = 0
+        self.rgb_counter = 0
+        self.depth_counter = 0
+        self.start_saving_continuous_data = False
+        self.continuous_data_directory_name = ""
+
+        self.have_image  = False
+        self.have_depth_image = False
+        self.rgb_image   = 0
+
+        #====== Subscriber ======
+        #print("USE_GAZEBO", self.USE_GAZEBO)
+        #if self.USE_GAZEBO:
+        #    image_topic = "/asus/rgb/image_rect_color"
+        #    depth_image_topic = "/asus/depth/image_rect_raw"
+        #else :
+        image_topic = "/asus/rgb/image_raw" # This works with real asus
+        # depth_image_topic = "/asus/depth/image_raw"  # This works with real asusimport cPickle
+
+        self.image_sub       = rospy.Subscriber(image_topic,Image,self.image_callback) #/asus or camera
+        # self.depth_image_sub = rospy.Subscriber(depth_image_topic, Image, self.depth_image_callback)
+
+        rospy.loginfo('done')
+
+
+    def image_callback(self,data):
+        try:
+			self.rgb_image = self.bridge.imgmsg_to_cv2(data, "bgr8")
+			self.have_image = True
+			t = rospy.Time.now()
+			self.rgb_counter = self.rgb_counter + 1
+			#image_rgb_name = "time_str(self.rgb_counter).jpg"  time = ros time
+
+            #TODO your code here
+			camera_intrinsic = yaml.load(open('../rgb_PS1080_PrimeSense.yaml'))
+    			cam_matrix = camera_intrinsic['projection_matrix']
+            		print cam_matrix
+    			cam_matrix = gt_info['cam_matrix']
+    		#principal = np.hstack((cam_matrix[0,2], cam_matrix[1,2]))
+    		#focal_len = np.hstack((cam_matrix[0,0],cam_matrix[1,1]))
+
+            if SAVE_IMAGE:
+    			image_rgb_name = "/home/xiaoqiangyan/Documents/MyData"+str(self.rgb_counter) + ".jpg"
+    			cv2.imwrite(image_rgb_name, self.rgb_image)
+        except CvBridgeError, e:
+            print e
+
+    # def depth_image_callback(self,data):
+    #     #http://answers.ros.org/question/58902/how-to-store-the-depth-data-from-kinectcameradepth_registreredimage_raw-as-gray-scale-image/
+    #     #if self.have_depth_image == False:
+    #     try:
+	# 		filename = "/home/xiaoqiangyan/data/"
+	# 		self.depth_counter += 1
+    #
+	# 		image_depth_name     = filename + '_depth_' +  str(self.depth_counter)+'.jpg'
+	# 		image_np_matrix_name_txt = filename + '_depth_' +  str(self.depth_counter)+'.txt'
+	# 		image_np_matrix_name = filename + '_depth_' +  str(self.depth_counter)
+    #
+	# 		depth_image_input = self.bridge.imgmsg_to_cv2(data, '16UC1') #32FC1 does not work with asus somehow.
+	# 		depth_image2 = np.array(depth_image_input,dtype=np.int16)
+    #
+	# 		self.depth_image = depth_image2
+	# 		#TODO choose one
+	# 		#cv2.imwrite(image_depth_name, self.depth_image/MAX_DEPTH_RANGE*255) #this is used for RSS
+	# 		#np.savetxt(image_np_matrix_name_txt, self.depth_image, fmt='%f')
+	# 		np.save(image_np_matrix_name, self.depth_image) # I recommend this one
+    #
+    #     except CvBridgeError, e:
+    #         print e
+    #
+
+
+def main(args):
+    rospy.init_node('perception__parameters_node')
+    ic = PerceptionParameterNode(rospy.get_name())
+    r = rospy.Rate(ROS_RUN_RATE)
+    try:
+        while not rospy.is_shutdown():
+
+            r.sleep()
+    except KeyboardInterrupt:
+        print "Shutting down"
+
+    cv2.destroyAllWindows()
+
+if __name__ == '__main__':
+    main(sys.argv)

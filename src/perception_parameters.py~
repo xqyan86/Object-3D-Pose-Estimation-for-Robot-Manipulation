@@ -1,0 +1,362 @@
+#!/usr/bin/env python
+
+# USE_GAZEBO = True
+
+# Import required Python code.
+import math
+import time
+from matplotlib import pyplot as plt
+import os
+import csv
+import cPickle
+
+#---- ROS ------
+import roslib; roslib.load_manifest('deep_pose_estimation')
+import rospkg
+import rospy
+import actionlib
+from cv_bridge import CvBridge, CvBridgeError
+from std_msgs.msg import *
+from sensor_msgs.msg import Image
+from sensor_msgs.msg import JointState
+from geometry_msgs.msg import WrenchStamped
+# ---- For Gazebo -----
+import std_srvs.srv as srv
+from geometry_msgs.msg import PoseArray
+import yaml
+import caffe
+from fast_rcnn.test import im_detect
+from fast_rcnn.config import cfg
+from fast_rcnn.nms_wrapper import nms
+import argparse
+import sys
+import time
+import numpy as np
+import cv2
+
+
+MAX_DEPTH_RANGE = 7000.0 #mm
+#SAVE_CONTINUOUS_DATA = False
+DRAW_EACH_IMAGE_FEATURE = False
+#ROS_RUN_RATE = 15
+ROS_RUN_RATE = 30
+MAX_NUMBER_IMAGES = ROS_RUN_RATE*60 # 1 min
+
+SAVE_IMAGE = True
+
+CLASSES = ('__background__', # always index 0
+			'002_master_chef_can',
+			'003_cracker_box',
+			'004_sugar_box',
+			'005_tomato_soup_can',
+			'006_mustard_bottle',
+			'007_tuna_fish_can',
+			'008_pudding_box',
+			'009_gelatin_box',
+			'010_potted_meat_can',
+			'011_banana',
+			'019_pitcher_base',
+			'021_bleach_cleanser',
+			'024_bowl',
+			'025_mug',
+			'035_power_drill',
+			'036_wood_block',
+			'037_scissors',
+			'040_large_marker',
+			'051_large_clamp',
+			'052_extra_large_clamp',
+			'061_foam_brick',
+			)
+
+CLASS_TO_IND = dict(zip(CLASSES, range(len(CLASSES))))
+
+COLORS = np.random.random((len(CLASSES), 3)) * 255
+COLORS = COLORS.astype(np.int)
+
+NNFile_path = '/home/xiaoqiangyan/Documents/py-faster-rcnn-pose-allregress/'
+NETS = {'vgg16': ('VGG16',
+		NNFile_path+'output/faster_rcnn_end2end/ycb__train/vgg16_faster_rcnn_pose_iter_50000.caffemodel')}
+
+
+
+class PerceptionParameterNode():
+	def __init__(self,name):
+		self.bridge = CvBridge()
+
+		self.img_counter = 0
+		self.rgb_counter = 0
+		self.depth_counter = 0
+		self.start_saving_continuous_data = False
+		self.continuous_data_directory_name = ""
+
+		self.have_image  = False
+		self.have_depth_image = False
+		self.rgb_image   = 0
+
+		#====== Subscriber ======
+		#print("USE_GAZEBO", self.USE_GAZEBO)
+		#if self.USE_GAZEBO:
+		#    image_topic = "/asus/rgb/image_rect_color"
+		#    depth_image_topic = "/asus/depth/image_rect_raw"
+		#else :
+		image_topic = "/asus/rgb/image_raw" # This works with real asus
+		# depth_image_topic = "/asus/depth/image_raw"  # This works with real asusimport cPickle
+
+		self.image_sub       = rospy.Subscriber(image_topic,Image,self.image_callback) #/asus or camera
+		# self.depth_image_sub = rospy.Subscriber(depth_image_topic, Image, self.depth_image_callback)
+
+		rospy.loginfo('done')
+
+	def draw_detections(self, im, dets, thresh=0.5):
+		"""Draw detected bounding boxes."""
+		show_im = im.copy()
+		keep_inds = np.where(dets[:, -2] >= thresh)[0]
+		dets = dets[keep_inds,:]
+		if len(keep_inds) == 0:
+			return show_im, None
+		#del_indexes = []
+		
+		print len(keep_inds), dets.shape
+		i = 0
+		while (i < dets.shape[0]):
+			cls_ind = int(dets[i, -1])
+			'''
+			print i, cls_ind
+			if i < dets.shape[0]-1 and cls_ind == int(dets[i+1,-1]):
+				print '<<<<<<<<<<<dismatch>>>>>>>>>>>>>>'
+				print int(dets[i+1,-1])
+				IoU_1 = compute_IoU(gt_boxes[i],dets[i,:4])
+				IoU_2 = compute_IoU(gt_boxes[i],dets[i+1,:4])
+				if IoU_1 > IoU_2:
+					dets = np.delete(dets, i+1, axis = 0)
+					#c = np.delete(c, i+1 ,axis=0)
+					print 'delete ', i+1
+					del_indexes.append(i+1)
+				else:
+					dets = np.delete(dets, i, axis = 0)
+					del_indexes.append(i)
+					print 'delete ', i
+					#c = np.delete(c, i ,axis=0)
+			'''
+			bbox = dets[i, :4]
+			score = dets[i, -2]
+			x1, y1, x2, y2 = bbox
+			cv2.rectangle(show_im, (int(x1), int(y1)), (int(x2), int(y2)), COLORS[cls_ind, :], 3)
+			font=cv2.FONT_HERSHEY_SIMPLEX
+			show_im = cv2.putText(show_im, CLASSES[cls_ind], (x1,y1), font, 0.5, (255,255,255),2)
+
+			i += 1
+			#print dets.shape[0], c.shape
+		return show_im
+
+	#accuracy_pose = np.zeros((22,2),dtype=np.float32)
+
+	def yaml_loader(self, filepath):
+		"""load yaml file"""
+		with open(filepath, "r") as file_descriptor:
+			data = yaml.load(file_descriptor)
+		return data
+	'''
+	def parse_args(self):
+		"""Parse input arguments."""
+		parser = argparse.ArgumentParser(description='Face Detection using Faster R-CNN')
+		parser.add_argument('--gpu', dest='gpu_id', help='GPU device id to use [0]',
+						default=0, type=int)
+		parser.add_argument('--cpu', dest='cpu_mode',
+						help='Use CPU mode (overrides --gpu)',
+						action='store_true')
+		parser.add_argument('--net', dest='demo_net', help='Network to use [vgg16]',
+						choices=NETS.keys(), default='vgg16')
+
+		args = parser.parse_args()
+
+		return args
+	'''
+
+	def image_callback(self,data):
+		try:
+			self.rgb_image = self.bridge.imgmsg_to_cv2(data, "bgr8")
+			self.have_image = True
+			t = rospy.Time.now()
+			self.rgb_counter = self.rgb_counter + 1
+			#image_rgb_name = "time_str(self.rgb_counter).jpg"  time = ros time
+
+			#TODO your code here
+			#get cam_matrix fromo .yaml file
+			#camera_intrinsic = self.yaml_loader("~/work/catkin_ws/src/deep_pose_estimation/rgb_PS1080_PrimeSense.yaml")
+			#cam_matrix = camera_intrinsic['projection_matrix']
+			#print cam_matrix
+			#principal = np.hstack((cam_matrix[0,2], cam_matrix[1,2]))
+			#focal_len = np.hstack((cam_matrix[0,0],cam_matrix[1,1]))
+			'''
+			cfg.TEST.HAS_RPN = True  # Use RPN for proposals
+			cfg.TEST.SCALES = (700, )
+			cfg.TEST.MAX_SIZE = 1333
+
+			args = self.parse_args()
+
+			prototxt = os.path.join(cfg.MODELS_DIR, NETS[args.demo_net][0],
+								'faster_rcnn_alt_opt', 'faster_rcnn_test.pt')
+			caffemodel = os.path.join(cfg.DATA_DIR, 'faster_rcnn_models',
+								  NETS[args.demo_net][1])
+
+			prototxt = NNFile_path+'models/ycb/VGG16/faster_rcnn_end2end/test.prototxt'
+			caffemodel = NETS[args.demo_net][1]
+
+			if not os.path.isfile(caffemodel):
+				raise IOError(('{:s} not found.\nDid you run'+ NNFile_path + 'data/script/'
+					   'fetch_faster_rcnn_models.sh?').format(caffemodel))
+
+			if args.cpu_mode:
+				caffe.set_mode_cpu()
+			else:
+				caffe.set_mode_gpu()
+				caffe.set_device(args.gpu_id)
+				cfg.GPU_ID = args.gpu_id
+			net = caffe.Net(prototxt, caffemodel, caffe.TEST)
+
+			print '\n\nLoaded network {:s}'.format(caffemodel)
+
+			CONF_THRESH = 0.8
+			NMS_THRESH = 0.5
+			'''	
+			# # Detect all object classes and regress object bounds
+			start = time.time()
+			#im = cv2.imread('/home/xiaoqiangyan/work/catkin_ws/src/deep_pose_estimation/src/000659-color.png')
+			im = self.rgb_image
+			show_im = im.copy()
+			scores, boxes, trans, rot = im_detect(net, im)
+			# print(scores.shape, boxes.shape, tz.shape, rot.shape)
+			end = time.time()
+			print ('Detection took {:.3f}s for '
+					'{:d} object proposals').format((end-start), boxes.shape[0])
+
+			all_dets = np.zeros((0, 6), dtype=np.float32)
+			all_trans = np.zeros((0, 3), dtype=np.float32)
+			all_rot = np.zeros((0, 4), dtype=np.float32)
+
+			for cls_ind, cls in enumerate(CLASSES[1:]):
+				#print('cls'.format(cls))
+				cls_ind += 1 # because we skipped background
+				cls_boxes = boxes[:, 4*cls_ind:4*(cls_ind + 1)]
+				cls_scores = scores[:, cls_ind]
+				dets = np.hstack((cls_boxes,
+								  cls_scores[:, np.newaxis])).astype(np.float32)
+				keep = nms(dets, NMS_THRESH)
+				dets = dets[keep, :]
+				# keep = np.where(dets[:, -1] >= CONF_THRESH)[0]
+				# dets = dets[keep, :]
+				# print(np.min(dets[:, -1]), np.max(dets[:, -1]))
+				dets = np.hstack((dets,
+								  cls_ind * np.ones((dets.shape[0], 1), dtype=np.float32)
+								  ))
+
+				all_dets = np.vstack((all_dets, dets))
+				all_trans = np.vstack((all_trans, trans[keep, :]))
+				all_rot = np.vstack((all_rot, rot[keep, :]))
+
+			show_im = self.draw_detections(show_im, all_dets, thresh=CONF_THRESH)
+
+			keep = np.where(all_dets[:, -2] >= CONF_THRESH)[0]
+			all_dets = all_dets[keep, :]
+			all_trans = all_trans[keep, :]
+			all_rot = all_rot[keep, :]
+
+			print('Objects Detected and the Predicted 3D Poses: ')
+			print('Objects         3D Translation          3D Rotation')
+			for idx in range(all_trans.shape[0]):
+				cls_ind = int(all_dets[idx, -1])
+				print(CLASSES[cls_ind], all_trans[idx],all_rot[idx])
+
+
+			if SAVE_IMAGE:
+				image_rgb_name = "/home/xiaoqiangyan/Documents/MyData"+str(self.rgb_counter) + ".jpg"
+				cv2.imwrite(image_rgb_name, show_im)
+		except CvBridgeError, e:
+			print e
+
+	# def depth_image_callback(self,data):
+	#     #http://answers.ros.org/question/58902/how-to-store-the-depth-data-from-kinectcameradepth_registreredimage_raw-as-gray-scale-image/
+	#     #if self.have_depth_image == False:
+	#     try:
+	# 		filename = "/home/xiaoqiangyan/data/"
+	# 		self.depth_counter += 1
+	#
+	# 		image_depth_name     = filename + '_depth_' +  str(self.depth_counter)+'.jpg'
+	# 		image_np_matrix_name_txt = filename + '_depth_' +  str(self.depth_counter)+'.txt'
+	# 		image_np_matrix_name = filename + '_depth_' +  str(self.depth_counter)
+	#
+	# 		depth_image_input = self.bridge.imgmsg_to_cv2(data, '16UC1') #32FC1 does not work with asus somehow.
+	# 		depth_image2 = np.array(depth_image_input,dtype=np.int16)
+	#
+	# 		self.depth_image = depth_image2
+	# 		#TODO choose one
+	# 		#cv2.imwrite(image_depth_name, self.depth_image/MAX_DEPTH_RANGE*255) #this is used for RSS
+	# 		#np.savetxt(image_np_matrix_name_txt, self.depth_image, fmt='%f')
+	# 		np.save(image_np_matrix_name, self.depth_image) # I recommend this one
+	#
+	#     except CvBridgeError, e:
+	#         print e
+	#
+
+def parse_args():
+	"""Parse input arguments."""
+	parser = argparse.ArgumentParser(description='Face Detection using Faster R-CNN')
+	parser.add_argument('--gpu', dest='gpu_id', help='GPU device id to use [0]',
+						default=0, type=int)
+	parser.add_argument('--cpu', dest='cpu_mode',
+					help='Use CPU mode (overrides --gpu)',
+					action='store_true')
+	parser.add_argument('--net', dest='demo_net', help='Network to use [vgg16]',
+					choices=NETS.keys(), default='vgg16')
+	args = parser.parse_args()
+
+	return args
+
+def main(args):
+        cfg.TEST.HAS_RPN = True  # Use RPN for proposals
+        cfg.TEST.SCALES = (700, )
+        cfg.TEST.MAX_SIZE = 1333
+	
+	
+        args = parse_args()
+
+        prototxt = os.path.join(cfg.MODELS_DIR, NETS[args.demo_net][0],
+        					'faster_rcnn_alt_opt', 'faster_rcnn_test.pt')
+	caffemodel = os.path.join(cfg.DATA_DIR, 'faster_rcnn_models',
+                                                                  NETS[args.demo_net][1])
+
+        prototxt = NNFile_path+'models/ycb/VGG16/faster_rcnn_end2end/test.prototxt'
+        caffemodel = NETS[args.demo_net][1]
+
+        if not os.path.isfile(caffemodel):
+                raise IOError(('{:s} not found.\nDid you run'+ NNFile_path + 'data/script/'
+                                     'fetch_faster_rcnn_models.sh?').format(caffemodel))
+
+        if args.cpu_mode:
+                caffe.set_mode_cpu()
+        else:
+                caffe.set_mode_gpu()
+	        caffe.set_device(args.gpu_id)
+	        cfg.GPU_ID = args.gpu_id
+        net = caffe.Net(prototxt, caffemodel, caffe.TEST)
+
+        print '\n\nLoaded network {:s}'.format(caffemodel)
+
+        CONF_THRESH = 0.8
+	NMS_THRESH = 0.5
+
+	rospy.init_node('perception__parameters_node')
+	ic = PerceptionParameterNode(rospy.get_name())
+	r = rospy.Rate(ROS_RUN_RATE)
+	try:
+		while not rospy.is_shutdown():
+
+			r.sleep()
+	except KeyboardInterrupt:
+		print "Shutting down"
+
+	cv2.destroyAllWindows()
+
+if __name__ == '__main__':
+	main(sys.argv)
